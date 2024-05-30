@@ -31,7 +31,7 @@ class BaseA(nn.Module):
         self.std = nn.Parameter(self.std)
         self.mean.requires_grad = False
         self.std.requires_grad = False
-
+        
 
 class BaseITS(nn.Module):
     def __init__(self):
@@ -416,6 +416,75 @@ class J4(Base):
 
         return x_p3
 
+class J5(Base):
+    def __init__(self, num_features=128):
+        super(J5, self).__init__()
+        self.num_features = num_features
+
+        resnext = ResNeXt101()
+        self.layer0 = resnext.layer0
+        self.layer1 = resnext.layer1
+        self.layer2 = resnext.layer2
+        self.layer3 = resnext.layer3
+        self.layer4 = resnext.layer4
+
+        self.down1 = nn.Sequential(
+            nn.Conv2d(256, num_features, kernel_size=1), nn.SELU()
+        )
+        self.down2 = nn.Sequential(
+            nn.Conv2d(512, num_features, kernel_size=1), nn.SELU()
+        )
+        self.down3 = nn.Sequential(
+            nn.Conv2d(1024, num_features, kernel_size=1), nn.SELU()
+        )
+        self.down4 = nn.Sequential(
+            nn.Conv2d(2048, num_features, kernel_size=1), nn.SELU()
+        )
+
+        self.refine = nn.Sequential(
+            nn.Conv2d(num_features, num_features, kernel_size=3, padding=1), nn.SELU(),
+            nn.Conv2d(num_features, num_features, kernel_size=3, padding=1), nn.SELU(),
+            nn.Conv2d(num_features, num_features, kernel_size=1)
+        )
+
+        self.p4 = nn.Sequential(
+            nn.Conv2d(num_features, num_features // 2, kernel_size=3, padding=1), nn.SELU(),
+            nn.Conv2d(num_features // 2, 3, kernel_size=1)
+        )
+
+        for m in self.modules():
+            if isinstance(m, nn.SELU) or isinstance(m, nn.ReLU):
+                m.inplace = True
+
+    def forward(self, x0):
+        x = (x0 - self.mean) / self.std
+
+        layer0 = self.layer0(x)
+        layer1 = self.layer1(layer0)
+        layer2 = self.layer2(layer1)
+        layer3 = self.layer3(layer2)
+        layer4 = self.layer4(layer3)
+
+        down1 = self.down1(layer1)
+        down2 = self.down2(layer2)
+        down3 = self.down3(layer3)
+        down4 = self.down4(layer4)
+
+        down2 = F.upsample(down2, size=down1.size()[2:], mode='bilinear')
+        down3 = F.upsample(down3, size=down1.size()[2:], mode='bilinear')
+        down4 = F.upsample(down4, size=down1.size()[2:], mode='bilinear')
+
+        f = (down1 + down2 + down3 + down4) / 4
+        f = self.refine(f) + f
+
+        log_x0 = torch.log(x0.clamp(min=1e-8))
+
+        p4 = F.upsample(self.p4(f), size=x0.size()[2:], mode='bilinear')
+
+        x_p4 = F.softplus(log_x0 + p4).clamp(min=0, max=1)
+
+        return x_p4
+    
 
 class ours_wo_AFIM(Base):
     def __init__(self, num_features=128):
@@ -784,6 +853,11 @@ class DM2FNet(Base):
             nn.Conv2d(num_features, num_features, kernel_size=3, padding=1), nn.SELU(),
             nn.Conv2d(num_features, num_features * 4, kernel_size=1)
         )
+        self.attention5 = nn.Sequential(
+            nn.Conv2d(num_features * 4, num_features, kernel_size=3, padding=1), nn.SELU(),
+            nn.Conv2d(num_features, num_features, kernel_size=3, padding=1), nn.SELU(),
+            nn.Conv2d(num_features, num_features * 4, kernel_size=1)
+        )
 
         self.refine = nn.Sequential(
             nn.Conv2d(num_features, num_features, kernel_size=3, padding=1), nn.SELU(),
@@ -807,12 +881,16 @@ class DM2FNet(Base):
             nn.Conv2d(num_features, num_features // 2, kernel_size=3, padding=1), nn.SELU(),
             nn.Conv2d(num_features // 2, 3, kernel_size=1)
         )
+        self.j5 = nn.Sequential(
+            nn.Conv2d(num_features, num_features // 2, kernel_size=3, padding=1), nn.SELU(),
+            nn.Conv2d(num_features // 2, 3, kernel_size=1)
+        )
 
         self.attention_fusion = nn.Sequential(
             nn.Conv2d(num_features * 4, num_features, kernel_size=1), nn.SELU(),
             nn.Conv2d(num_features, num_features // 2, kernel_size=3, padding=1), nn.SELU(),
             nn.Conv2d(num_features // 2, num_features // 2, kernel_size=3, padding=1), nn.SELU(),
-            nn.Conv2d(num_features // 2, 15, kernel_size=1)
+            nn.Conv2d(num_features // 2, 18, kernel_size=1)
         )
 
         for m in self.modules():
@@ -882,6 +960,12 @@ class DM2FNet(Base):
         f4 = down1 * attention4[:, 0, :, :, :] + down2 * attention4[:, 1, :, :, :] + \
              down3 * attention4[:, 2, :, :, :] + down4 * attention4[:, 3, :, :, :]
         f4 = self.refine(f4) + f4
+        
+        attention5 = self.attention5(concat)
+        attention5 = F.softmax(attention5.view(n, 4, c, h, w), 1)
+        f5 = down1 * attention5[:, 0, :, :, :] + down2 * attention5[:, 1, :, :, :] + \
+             down3 * attention5[:, 2, :, :, :] + down4 * attention5[:, 3, :, :, :]
+        f5 = self.refine(f5) + f5
 
         if x0_hd is not None:
             x0 = x0_hd
@@ -912,20 +996,45 @@ class DM2FNet(Base):
         # x_j4 = (torch.log(1 + r4 * x0)).clamp(min=0, max=1)
         x_j4 = (torch.log(1 + torch.exp(log_x0 + r4))).clamp(min=0., max=1.)
 
-        attention_fusion = F.upsample(self.attention_fusion(concat), size=x0.size()[2:], mode='bilinear')
-        x_f0 = torch.sum(F.softmax(attention_fusion[:, :5, :, :], 1) *
-                         torch.stack((x_phy[:, 0, :, :], x_j1[:, 0, :, :], x_j2[:, 0, :, :],
-                                      x_j3[:, 0, :, :], x_j4[:, 0, :, :]), 1), 1, True)
-        x_f1 = torch.sum(F.softmax(attention_fusion[:, 5: 10, :, :], 1) *
-                         torch.stack((x_phy[:, 1, :, :], x_j1[:, 1, :, :], x_j2[:, 1, :, :],
-                                      x_j3[:, 1, :, :], x_j4[:, 1, :, :]), 1), 1, True)
-        x_f2 = torch.sum(F.softmax(attention_fusion[:, 10:, :, :], 1) *
-                         torch.stack((x_phy[:, 2, :, :], x_j1[:, 2, :, :], x_j2[:, 2, :, :],
-                                      x_j3[:, 2, :, :], x_j4[:, 2, :, :]), 1), 1, True)
-        x_fusion = torch.cat((x_f0, x_f1, x_f2), 1).clamp(min=0., max=1.)
+        
+        r5 = F.upsample(self.j5(f5), size=x0.size()[2:], mode='bilinear')
+        x_j5 = F.softplus(log_x0 + r5).clamp(min=0., max=1.)
+        
+        
+        
+        # attention_fusion = F.upsample(self.attention_fusion(concat), size=x0.size()[2:], mode='bilinear')
+        # x_f0 = torch.sum(F.softmax(attention_fusion[:, :5, :, :], 1) *
+        #                  torch.stack((x_phy[:, 0, :, :], x_j1[:, 0, :, :], x_j2[:, 0, :, :],
+        #                               x_j3[:, 0, :, :], x_j4[:, 0, :, :]), 1), 1, True)
+        # x_f1 = torch.sum(F.softmax(attention_fusion[:, 5: 10, :, :], 1) *
+        #                  torch.stack((x_phy[:, 1, :, :], x_j1[:, 1, :, :], x_j2[:, 1, :, :],
+        #                               x_j3[:, 1, :, :], x_j4[:, 1, :, :]), 1), 1, True)
+        # x_f2 = torch.sum(F.softmax(attention_fusion[:, 10:, :, :], 1) *
+        #                  torch.stack((x_phy[:, 2, :, :], x_j1[:, 2, :, :], x_j2[:, 2, :, :],
+        #                               x_j3[:, 2, :, :], x_j4[:, 2, :, :]), 1), 1, True)
+        # x_fusion = torch.cat((x_f0, x_f1, x_f2), 1).clamp(min=0., max=1.)
 
+        attention_fusion = F.upsample(self.attention_fusion(concat), size=x0.size()[2:], mode='bilinear')
+
+        # Update to include x_j5 for the first channel
+        x_f0 = torch.sum(F.softmax(attention_fusion[:, :6, :, :], 1) *
+                        torch.stack((x_phy[:, 0, :, :], x_j1[:, 0, :, :], x_j2[:, 0, :, :],
+                                    x_j3[:, 0, :, :], x_j4[:, 0, :, :], x_j5[:, 0, :, :]), 1), 1, True)
+
+        # Update to include x_j5 for the second channel
+        x_f1 = torch.sum(F.softmax(attention_fusion[:, 6:12, :, :], 1) *
+                        torch.stack((x_phy[:, 1, :, :], x_j1[:, 1, :, :], x_j2[:, 1, :, :],
+                                    x_j3[:, 1, :, :], x_j4[:, 1, :, :], x_j5[:, 1, :, :]), 1), 1, True)
+
+        # Update to include x_j5 for the third channel
+        x_f2 = torch.sum(F.softmax(attention_fusion[:, 12:, :, :], 1) *
+                        torch.stack((x_phy[:, 2, :, :], x_j1[:, 2, :, :], x_j2[:, 2, :, :],
+                                    x_j3[:, 2, :, :], x_j4[:, 2, :, :], x_j5[:, 2, :, :]), 1), 1, True)
+
+        # Concatenate the three channels
+        x_fusion = torch.cat((x_f0, x_f1, x_f2), 1).clamp(min=0., max=1.)
         if self.training:
-            return x_fusion, x_phy, x_j1, x_j2, x_j3, x_j4, t, a.view(x.size(0), -1)
+            return x_fusion, x_phy, x_j1, x_j2, x_j3, x_j4,x_j5, t, a.view(x.size(0), -1)
         else:
             return x_fusion
 

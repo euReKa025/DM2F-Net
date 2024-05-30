@@ -22,7 +22,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description='Train a DM2FNet')
     parser.add_argument(
         '--gpus', type=str, default='0', help='gpus to use ')
-    parser.add_argument('--ckpt-path', default='./ckpt', help='checkpoint path')
+    parser.add_argument('--ckpt-path', default='./ckpt_improve_v3', help='checkpoint path')
     parser.add_argument(
         '--exp-name',
         default='RESIDE_ITS',
@@ -84,6 +84,7 @@ def train(net, optimizer):
         loss_x_jf_record, loss_x_j0_record = AvgMeter(), AvgMeter()
         loss_x_j1_record, loss_x_j2_record = AvgMeter(), AvgMeter()
         loss_x_j3_record, loss_x_j4_record = AvgMeter(), AvgMeter()
+        loss_x_j5_record = AvgMeter()
         loss_t_record, loss_a_record = AvgMeter(), AvgMeter()
 
         for data in train_loader:
@@ -103,7 +104,7 @@ def train(net, optimizer):
 
             optimizer.zero_grad()
 
-            x_jf, x_j0, x_j1, x_j2, x_j3, x_j4, t, a = net(haze)
+            x_jf, x_j0, x_j1, x_j2, x_j3, x_j4, x_j5, t, a = net(haze)
 
             loss_x_jf = criterion(x_jf, gt)
             loss_x_j0 = criterion(x_j0, gt)
@@ -111,11 +112,12 @@ def train(net, optimizer):
             loss_x_j2 = criterion(x_j2, gt)
             loss_x_j3 = criterion(x_j3, gt)
             loss_x_j4 = criterion(x_j4, gt)
+            loss_x_j5 = criterion(x_j5, gt)
 
             loss_t = criterion(t, gt_trans_map)
             loss_a = criterion(a, gt_ato)
 
-            loss = loss_x_jf + loss_x_j0 + loss_x_j1 + loss_x_j2 + loss_x_j3 + loss_x_j4 \
+            loss = loss_x_jf + loss_x_j0 + loss_x_j1 + loss_x_j2 + loss_x_j3 + loss_x_j4 + loss_x_j5 \
                    + 10 * loss_t + loss_a
             loss.backward()
 
@@ -130,6 +132,7 @@ def train(net, optimizer):
             loss_x_j2_record.update(loss_x_j2.item(), batch_size)
             loss_x_j3_record.update(loss_x_j3.item(), batch_size)
             loss_x_j4_record.update(loss_x_j4.item(), batch_size)
+            loss_x_j5_record.update(loss_x_j5.item(), batch_size)
 
             loss_t_record.update(loss_t.item(), batch_size)
             loss_a_record.update(loss_a.item(), batch_size)
@@ -137,11 +140,11 @@ def train(net, optimizer):
             curr_iter += 1
 
             log = '[iter %d], [train loss %.5f], [loss_x_fusion %.5f], [loss_x_phy %.5f], [loss_x_j1 %.5f], ' \
-                  '[loss_x_j2 %.5f], [loss_x_j3 %.5f], [loss_x_j4 %.5f], [loss_t %.5f], [loss_a %.5f], ' \
-                  '[lr %.13f]' % \
+                  '[loss_x_j2 %.5f], [loss_x_j3 %.5f], [loss_x_j4 %.5f], [loss_x_j5 %.5f], [loss_t %.5f], ' \
+                  '[loss_a %.5f], [lr %.13f]' % \
                   (curr_iter, train_loss_record.avg, loss_x_jf_record.avg, loss_x_j0_record.avg,
                    loss_x_j1_record.avg, loss_x_j2_record.avg, loss_x_j3_record.avg, loss_x_j4_record.avg,
-                   loss_t_record.avg, loss_a_record.avg, optimizer.param_groups[1]['lr'])
+                   loss_x_j5_record.avg, loss_t_record.avg, loss_a_record.avg, optimizer.param_groups[1]['lr'])
             print(log)
             open(log_path, 'a').write(log + '\n')
 

@@ -6,12 +6,16 @@ import torch
 from torch import nn
 from torchvision import transforms
 
-from tools.config import TEST_SOTS_ROOT, OHAZE_ROOT
+from tools.config import TEST_SOTS_ROOT, OHAZE_ROOT, HazeRD_ROOT, MY5pic_ROOT
 from tools.utils import AvgMeter, check_mkdir, sliding_forward
 from model import DM2FNet, DM2FNet_woPhy
-from datasets import SotsDataset, OHazeDataset
+from datasets import SotsDataset, OHazeDataset, HazerdDataset, MY5picDataset
 from torch.utils.data import DataLoader
 from skimage.metrics import peak_signal_noise_ratio, structural_similarity
+
+from sklearn.metrics import mean_squared_error
+from skimage.color import deltaE_ciede2000, rgb2lab
+
 
 os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 
@@ -19,17 +23,22 @@ torch.manual_seed(2018)
 torch.cuda.set_device(0)
 
 ckpt_path = './ckpt'
-# exp_name = 'RESIDE_ITS'
-exp_name = 'O-Haze'
+# ckpt_path = './ckpt_improve_v3'
+exp_name = 'RESIDE_ITS'
+# exp_name = 'O-HAZE'
 
 args = {
-    # 'snapshot': 'iter_40000_loss_0.01230_lr_0.000000',
-    'snapshot': 'iter_19000_loss_0.04261_lr_0.000014',
+    # 'snapshot': 'iter_40000_loss_0.01426_lr_0.000000', #baseline
+    # 'snapshot': 'iter_40000_loss_0.01394_lr_0.000000'
+    # 'snapshot': 'iter_40000_loss_0.01322_lr_0.000000'
+    'snapshot': 'iter_40000_loss_0.01170_lr_0.000000', #改成对应名称
 }
 
 to_test = {
-    # 'SOTS': TEST_SOTS_ROOT,
-    'O-Haze': OHAZE_ROOT,
+    'SOTS': TEST_SOTS_ROOT,
+    # 'O-Haze': OHAZE_ROOT,
+    # 'HazeRD': HazeRD_ROOT,
+    # 'MY5pic': MY5pic_ROOT
 }
 
 to_pil = transforms.ToPILImage()
@@ -44,8 +53,14 @@ def main():
                 net = DM2FNet().cuda()
                 dataset = SotsDataset(root)
             elif 'O-Haze' in name:
-                net = DM2FNet_woPhy().cuda()
+                net = DM2FNet().cuda()
                 dataset = OHazeDataset(root, 'test')
+            elif 'HazeRD' in name:
+                net = DM2FNet().cuda()
+                dataset = HazerdDataset(root)
+            elif 'MY5pic' in name:
+                net = DM2FNet().cuda()
+                dataset = MY5picDataset(root)
             else:
                 raise NotImplementedError
 
@@ -60,6 +75,8 @@ def main():
 
             psnrs, ssims = [], []
             loss_record = AvgMeter()
+            mse_scores = []
+            ciede2000_scores = []
 
             for idx, data in enumerate(dataloader):
                 # haze_image, _, _, _, fs = data
@@ -78,24 +95,43 @@ def main():
 
                 loss = criterion(res, gts.cuda())
                 loss_record.update(loss.item(), haze.size(0))
+                
 
                 for i in range(len(fs)):
                     r = res[i].cpu().numpy().transpose([1, 2, 0])
                     gt = gts[i].cpu().numpy().transpose([1, 2, 0])
+                    # 计算 MSE
+                    mse = mean_squared_error(gt.reshape(-1, 3), r.reshape(-1, 3))
+                    mse_scores.append(mse)
+
+                    
                     psnr = peak_signal_noise_ratio(gt, r)
                     psnrs.append(psnr)
-                    ssim = structural_similarity(gt, r, data_range=1, multichannel=True,
-                                                 gaussian_weights=True, sigma=1.5, use_sample_covariance=False)
+                    ssim = structural_similarity(gt, r, win_size = 3,data_range=1, multichannel=True,
+                                                 gaussian_weights=True, sigma=1.5, use_sample_covariance=False,
+                                                 channel_axis=-1)
                     ssims.append(ssim)
-                    print('predicting for {} ({}/{}) [{}]: PSNR {:.4f}, SSIM {:.4f}'
-                          .format(name, idx + 1, len(dataloader), fs[i], psnr, ssim))
+                    
+                    # 计算 CIEDE2000
+                    gt_lab = rgb2lab(gt)
+                    r_lab = rgb2lab(r)
+                    # gt_lab = convert_color(gt, LabColor)
+                    # r_lab = convert_color(r, LabColor)
+                    # gt_lab = XYZ_to_Lab(gt_xyz)
+                    # r_lab = XYZ_to_Lab(r_xyz)
+                    # print(gt_lab.__class__.__name__)
+                    ciede2000 = deltaE_ciede2000(gt_lab, r_lab)
+                    ciede2000_avg = ciede2000.mean()
+                    ciede2000_scores.append(ciede2000.mean())
+                    print('predicting for {} ({}/{}) [{}]: MSE: {:.4f}, PSNR {:.4f}, SSIM {:.4f}, CIEDE2000: {:.4f}'
+                          .format(name, idx + 1, len(dataloader), fs[i], mse, psnr, ssim, ciede2000_avg))
 
                 for r, f in zip(res.cpu(), fs):
                     to_pil(r).save(
                         os.path.join(ckpt_path, exp_name,
                                      '(%s) %s_%s' % (exp_name, name, args['snapshot']), '%s.png' % f))
 
-            print(f"[{name}] L1: {loss_record.avg:.6f}, PSNR: {np.mean(psnrs):.6f}, SSIM: {np.mean(ssims):.6f}")
+            print(f"[{name}] L1: {loss_record.avg:.6f}, MSE: {np.mean(mse_scores):.6f}, PSNR: {np.mean(psnrs):.6f}, SSIM: {np.mean(ssims):.6f}, CIEDE2000: {np.mean(ciede2000_scores):.6f}")
 
 
 if __name__ == '__main__':
